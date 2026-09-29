@@ -2,6 +2,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 RUNS_DIR = ROOT / "runs"
+PRETRAINED = ROOT / "pretrained" / "policy.onnx"
 
 
 def latest_run() -> Path:
@@ -13,6 +14,11 @@ def latest_run() -> Path:
 
 def resolve_policy(arg: str) -> Path:
   if arg == "latest":
-    return latest_run() / "policy.onnx"
+    try:
+      return latest_run() / "policy.onnx"
+    except FileNotFoundError:
+      if PRETRAINED.exists():
+        return PRETRAINED
+      raise
   p = Path(arg)
   return p / "policy.onnx" if p.is_dir() else p

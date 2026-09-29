@@ -73,4 +73,3 @@ Joint target = default pose + action × action_scale.
 | `scripts/joint_test.py`, `check_collisions.py` | Earlier model-checking tools (unchanged). |
 
 
-# .venv/bin/mjpython scripts/play.py --policy runs/2026-09-29_04-22-43/checkpoints/oc1_ppo_19021824_steps.onnx
