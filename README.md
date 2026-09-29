@@ -1,8 +1,8 @@
 # OC1 biped velocity policy — trained on a Mac
 
 The OC1 biped (10 joints, 26.3 kg, `urdf/oc1_bipedal.urdf`) trained to walk by following
-velocity commands. It uses the exact training setup from `~/Desktop/g1_mac_rl`
-(the Unitree-G1-Flat task from unitree_rl_mjlab re-built for CPU MuJoCo):
+velocity commands. It uses the same training setup as the Unitree-G1-Flat task from
+unitree_rl_mjlab, rebuilt for CPU MuJoCo:
 
 - same PPO (asymmetric actor-critic, 512-256-128 ELU, 24 steps × 2048 envs, 5 epochs,
   4 mini-batches, adaptive LR 1e-3 / KL 0.01, entropy 0.01, clip 0.2, γ 0.99, λ 0.95)
@@ -12,6 +12,19 @@ velocity commands. It uses the exact training setup from `~/Desktop/g1_mac_rl`
   action_scale = 0.25·torque_limit/Kp), 200 Hz physics, 50 Hz policy
 - same checkpoint + video schedule: `oc1_ppo_<steps>_steps.pt/.onnx` and
   `videos/step_<steps>.mp4` every 1M steps, 3000 iterations by default
+
+## Layout
+
+```
+oc1_bipedal/
+├── urdf/oc1_bipedal.urdf   robot description (meshes referenced as package://oc1_bipedal/meshes/…)
+├── meshes/                 STL meshes used by the URDF
+├── oc1_rl/                 model builder, environment, PPO, path helpers
+├── scripts/                train / play / record / eval, plus model-checking tools
+├── pretrained/             policy.onnx + demo.mp4 (ready to run)
+├── runs/                   created by training (git-ignored)
+└── requirements.txt
+```
 
 ## Setup
 
@@ -87,9 +100,15 @@ Joint target = default pose + action × action_scale.
 |---|---|
 | `oc1_rl/robot.py` | Builds the MuJoCo model from the URDF: base frame, actuators and gains, foot spheres, sensors, floor. |
 | `oc1_rl/env.py` | The task: 2048 robots stepped in parallel, observations, rewards, commands, pushes, randomization, resets (G1 env with the robot swapped). |
-| `oc1_rl/ppo.py` | PPO (identical to `g1_rl/ppo.py`). |
+| `oc1_rl/ppo.py` | PPO (same as the G1 setup). |
+| `oc1_rl/paths.py` | Finds `runs/` and resolves `--policy` (file, run folder or `latest`). |
 | `scripts/train.py` | Training loop, checkpoints + ONNX + video every 1M steps, `--resume`. |
 | `scripts/record_video.py`, `play.py`, `eval_policy.py` | Video, interactive viewer, scoring. |
 | `scripts/joint_test.py`, `check_collisions.py` | Earlier model-checking tools (unchanged). |
+
+```bash
+.venv/bin/python scripts/joint_test.py                                             # move each joint with sliders
+.venv/bin/python scripts/check_collisions.py urdf/oc1_bipedal.urdf --meshdir ../meshes  # collision checks
+```
 
 

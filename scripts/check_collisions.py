@@ -1,10 +1,10 @@
 """
-check_collisions.py - verify the collision geometry of oc1_bipedal_collision.urdf in MuJoCo.
+check_collisions.py - verify the collision geometry of urdf/oc1_bipedal.urdf in MuJoCo.
 
 Usage:
-    python check_collisions.py oc1_bipedal_collision.urdf --meshdir meshes
-    python check_collisions.py oc1_bipedal_collision.urdf --meshdir meshes --view
-    python check_collisions.py oc1_bipedal_collision.urdf --meshdir meshes --effort 60
+    python scripts/check_collisions.py urdf/oc1_bipedal.urdf --meshdir ../meshes
+    python scripts/check_collisions.py urdf/oc1_bipedal.urdf --meshdir ../meshes --view
+    python scripts/check_collisions.py urdf/oc1_bipedal.urdf --meshdir ../meshes --effort 60
 
 Checks:
   1. Inventory     - every rigid body has collision geoms.
