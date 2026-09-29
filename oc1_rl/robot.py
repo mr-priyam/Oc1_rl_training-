@@ -1,0 +1,300 @@
+"""OC1 biped (10 DoF) model and constants, set up the same way as g1_rl/robot.py.
+
+The model is built from urdf/oc1_bipedal.urdf. The URDF's root frame (torso_ss) faces
++y with the left leg on -x, so a `base` link is added at the hip centre, rotated so the
+robot faces +x, left is +y and up is +z (the convention the velocity task assumes).
+"""
+
+import re
+from pathlib import Path
+
+import mujoco
+import numpy as np
+
+ROOT = Path(__file__).resolve().parents[1]
+URDF_PATH = ROOT / "urdf" / "oc1_bipedal.urdf"
+MESH_DIR = ROOT / "meshes"
+
+# Joint order of the model (URDF order, right leg first). Also the action order.
+JOINT_NAMES = (
+  "right_hip_pitch", "right_hip_roll", "right_hip_yaw", "right_knee_pitch", "right_ankle_pitch",
+  "left_hip_pitch", "left_hip_roll", "left_hip_yaw", "left_knee_pitch", "left_ankle_pitch",
+)
+NUM_JOINTS = len(JOINT_NAMES)
+BASE_BODY = "base"
+FOOT_BODIES = {"left": "lf", "right": "rf"}
+
+# Hip centre in the torso_ss frame, and the torso_ss -> base rotation (yaw -90 deg).
+_HIP_CENTRE = np.array([-0.1297, -0.0660, -0.0640])
+_TORSO_RPY = (0.0, 0.0, -np.pi / 2)
+
+# Home pose: slight knee bend like the G1 (hip -0.1, knee 0.3, ankle -0.2 about +y).
+# Joint axes point either way along the pitch axis, hence the per-joint signs.
+_DEFAULT_POS = {
+  "right_hip_pitch": -0.1, "right_knee_pitch": -0.3, "right_ankle_pitch": 0.2,
+  "left_hip_pitch": 0.1, "left_knee_pitch": 0.3, "left_ankle_pitch": 0.2,
+}
+
+# Motors: hip pitch, hip roll and knee are Robstride RS04; hip yaw and ankle are RS03
+# (from the motor meshes on each link). Peak torques are from the datasheets; armature
+# (reflected rotor inertia) is an estimate. Gains use the G1 recipe: 10 Hz natural
+# frequency, damping ratio 2.
+_NATURAL_FREQ = 10 * 2.0 * np.pi
+_DAMPING_RATIO = 2.0
+_ARM_RS04, _EFFORT_RS04 = 0.04, 120.0
+_ARM_RS03, _EFFORT_RS03 = 0.02, 60.0
+
+# (joint regexes, armature, effort limit)
+_ACTUATOR_GROUPS = (
+  ((r".*_hip_pitch", r".*_hip_roll", r".*_knee_pitch"), _ARM_RS04, _EFFORT_RS04),
+  ((r".*_hip_yaw", r".*_ankle_pitch"), _ARM_RS03, _EFFORT_RS03),
+)
+
+SOFT_JOINT_LIMIT_FACTOR = 0.9
+
+# Foot contact: 7 small spheres on each sole (like the G1), in the foot body frame.
+# The sole is the plane z = -0.105, x in [-0.145, 0.015], y in [-0.152, 0.088] (toe at -y).
+_SOLE_Z = -0.105
+_FOOT_SPHERE_RADIUS = 0.01
+_FOOT_SPHERES = [(x, y) for x in (-0.135, 0.005) for y in (-0.142, -0.032, 0.078)] + [(-0.065, -0.032)]
+FOOT_SITE_POS = (-0.065, -0.032, _SOLE_Z)
+FOOT_GEOM_RE = re.compile(r"^(left|right)_foot[1-7]_collision$")
+
+# Collision bitmasks: the floor only touches the foot spheres and the non-foot meshes,
+# so the feet stand on their spheres while fallen legs/torso still hit the ground.
+_FLOOR = dict(contype=2, conaffinity=2)
+_BODY_MESH = dict(contype=1, conaffinity=3)
+_FOOT_MESH = dict(contype=1, conaffinity=1)
+_FOOT_SPHERE = dict(contype=2, conaffinity=2)
+
+
+def _match(table, name):
+  for pattern, value in table:
+    if re.fullmatch(pattern, name):
+      return value
+  raise KeyError(name)
+
+
+def _actuator_params(name):
+  for patterns, armature, effort in _ACTUATOR_GROUPS:
+    if any(re.fullmatch(p, name) for p in patterns):
+      kp = armature * _NATURAL_FREQ**2
+      kd = 2.0 * _DAMPING_RATIO * armature * _NATURAL_FREQ
+      return armature, kp, kd, effort
+  raise KeyError(name)
+
+
+DEFAULT_JOINT_POS = np.array([_DEFAULT_POS.get(j, 0.0) for j in JOINT_NAMES])
+_PARAMS = np.array([_actuator_params(j) for j in JOINT_NAMES])
+ARMATURE, KP, KD, EFFORT_LIMIT = _PARAMS.T
+ACTION_SCALE = 0.25 * EFFORT_LIMIT / KP
+
+
+def _std_table(table):
+  return np.array([_match(table, j) for j in JOINT_NAMES])
+
+
+# Posture reward tolerances (the G1 values for the matching joints).
+POSE_STD_STANDING = np.full(NUM_JOINTS, 0.05)
+POSE_STD_WALKING = _std_table((
+  (r".*hip_pitch.*", 0.5), (r".*hip_roll.*", 0.15), (r".*hip_yaw.*", 0.15),
+  (r".*knee.*", 0.5), (r".*ankle_pitch.*", 0.15),
+))
+POSE_STD_RUNNING = _std_table((
+  (r".*hip_pitch.*", 0.5), (r".*hip_roll.*", 0.25), (r".*hip_yaw.*", 0.25),
+  (r".*knee.*", 0.5), (r".*ankle_pitch.*", 0.25),
+))
+
+
+def _urdf_xml(visual: bool) -> str:
+  xml = URDF_PATH.read_text()
+  xml = re.sub(r'filename="package://[^"]*/meshes/', 'filename="', xml)
+  origin = np.array([[0, 1, 0], [-1, 0, 0], [0, 0, 1]]) @ -_HIP_CENTRE  # Rz(-90) @ (0 - hip)
+  base = (
+    f'<mujoco><compiler meshdir="{MESH_DIR}" discardvisual="{str(not visual).lower()}" '
+    'fusestatic="true" strippath="false" balanceinertia="true"/></mujoco>'
+    f'<link name="{BASE_BODY}"/>'
+    f'<joint name="base_to_torso" type="fixed"><parent link="{BASE_BODY}"/>'
+    '<child link="torso_ss"/>'
+    f'<origin xyz="{origin[0]} {origin[1]} {origin[2]}" '
+    f'rpy="{_TORSO_RPY[0]} {_TORSO_RPY[1]} {_TORSO_RPY[2]}"/></joint>'
+  )
+  return re.sub(r"(<robot[^>]*>)", lambda mt: mt.group(1) + base, xml, count=1)
+
+
+def _read_stl(path: Path) -> np.ndarray:
+  """Vertices of a binary STL file, (n, 3)."""
+  raw = path.read_bytes()
+  n = int(np.frombuffer(raw, np.uint32, 1, 80)[0])
+  tri = np.frombuffer(raw, np.dtype([("normal", "<f4", 3), ("v", "<f4", (3, 3)), ("attr", "<u2")]),
+                      n, 84)
+  return np.unique(tri["v"].reshape(-1, 3).astype(np.float64), axis=0)
+
+
+def _farthest_points(points: np.ndarray, k: int) -> np.ndarray:
+  idx = [int(np.argmax(np.linalg.norm(points - points.mean(0), axis=1)))]
+  dist = np.linalg.norm(points - points[idx[0]], axis=1)
+  for _ in range(min(k, len(points)) - 1):
+    idx.append(int(np.argmax(dist)))
+    dist = np.minimum(dist, np.linalg.norm(points - points[idx[-1]], axis=1))
+  return points[idx]
+
+
+HULL_POINTS = 64
+
+
+def _use_convex_hulls(spec: mujoco.MjSpec):
+  """Point every collision geom at a simplified convex hull of its mesh.
+
+  MuJoCo collides meshes through their convex hull anyway, but the full CAD meshes make
+  each model ~84 MB, far too much for one copy per env (domain randomization). Each hull
+  is thinned to HULL_POINTS well-spread vertices, which stays within a few mm of it.
+  """
+  from scipy.spatial import ConvexHull
+
+  hulls = {}
+  for geom in spec.geoms:
+    if geom.type != mujoco.mjtGeom.mjGEOM_MESH or not geom.name.endswith("_collision"):
+      continue
+    mesh = spec.mesh(geom.meshname)
+    if mesh.name not in hulls:
+      verts = _read_stl(MESH_DIR / Path(mesh.file).name) * np.asarray(mesh.scale)
+      hull = spec.add_mesh(name=f"{mesh.name}_hull")
+      hull.uservert = _farthest_points(verts[ConvexHull(verts).vertices], HULL_POINTS).ravel().tolist()
+      hulls[mesh.name] = hull.name
+    geom.meshname = hulls[mesh.name]
+  for mesh in list(spec.meshes):
+    if mesh.name not in hulls.values() and not any(g.meshname == mesh.name for g in spec.geoms):
+      spec.delete(mesh)
+
+
+def _add_scene(spec: mujoco.MjSpec):
+  spec.option.timestep = 0.005
+  spec.option.iterations = 10
+  spec.option.ls_iterations = 20
+  spec.visual.headlight.diffuse = [0.6, 0.6, 0.6]
+  spec.visual.headlight.ambient = [0.3, 0.3, 0.3]
+  spec.visual.headlight.specular = [0, 0, 0]
+  spec.visual.global_.azimuth = 120
+  spec.visual.global_.elevation = -20
+  spec.add_texture(name="skybox", type=mujoco.mjtTexture.mjTEXTURE_SKYBOX,
+                   builtin=mujoco.mjtBuiltin.mjBUILTIN_GRADIENT,
+                   rgb1=[0.3, 0.5, 0.7], rgb2=[0, 0, 0], width=512, height=3072)
+  spec.add_texture(name="groundplane", type=mujoco.mjtTexture.mjTEXTURE_2D,
+                   builtin=mujoco.mjtBuiltin.mjBUILTIN_CHECKER, mark=mujoco.mjtMark.mjMARK_EDGE,
+                   rgb1=[0.2, 0.3, 0.4], rgb2=[0.1, 0.2, 0.3], markrgb=[0.8, 0.8, 0.8],
+                   width=300, height=300)
+  mat = spec.add_material(name="groundplane", texuniform=True, texrepeat=[5, 5], reflectance=0.2)
+  mat.textures[mujoco.mjtTextureRole.mjTEXROLE_RGB] = "groundplane"
+  spec.worldbody.add_light(pos=[0, 0, 3.5], dir=[0, 0, -1], type=mujoco.mjtLightType.mjLIGHT_DIRECTIONAL)
+  spec.worldbody.add_geom(name="floor", type=mujoco.mjtGeom.mjGEOM_PLANE, size=[0, 0, 0.05],
+                          material="groundplane", **_FLOOR)
+
+
+def _add_sensors(spec: mujoco.MjSpec):
+  S = mujoco.mjtSensor
+  OBJ = mujoco.mjtObj
+  for side, body in FOOT_BODIES.items():
+    spec.add_sensor(name=f"{side}_foot_pos", type=S.mjSENS_FRAMEPOS, objtype=OBJ.mjOBJ_SITE,
+                    objname=f"{side}_foot")
+  for side, body in FOOT_BODIES.items():
+    spec.add_sensor(name=f"{side}_foot_vel", type=S.mjSENS_FRAMELINVEL, objtype=OBJ.mjOBJ_SITE,
+                    objname=f"{side}_foot")
+  spec.add_sensor(name="torso_quat", type=S.mjSENS_FRAMEQUAT, objtype=OBJ.mjOBJ_BODY,
+                  objname=BASE_BODY)
+  spec.add_sensor(name="torso_angvel", type=S.mjSENS_FRAMEANGVEL, objtype=OBJ.mjOBJ_BODY,
+                  objname=BASE_BODY)
+  spec.add_sensor(name="root_angmom", type=S.mjSENS_SUBTREEANGMOM, objtype=OBJ.mjOBJ_BODY,
+                  objname=BASE_BODY)
+  # Contact sensors: data="found force" (bits 0 and 1), reduce="netforce" / "maxforce".
+  found_force = 1 | 2
+  for side, body in FOOT_BODIES.items():
+    spec.add_sensor(name=f"{side}_foot_contact", type=S.mjSENS_CONTACT,
+                    objtype=OBJ.mjOBJ_XBODY, objname=body, reftype=OBJ.mjOBJ_GEOM, refname="floor",
+                    intprm=[found_force, 3, 1])
+  spec.add_sensor(name="self_contact", type=S.mjSENS_CONTACT,
+                  objtype=OBJ.mjOBJ_XBODY, objname=BASE_BODY, reftype=OBJ.mjOBJ_XBODY,
+                  refname=BASE_BODY, intprm=[found_force, 2, 1])
+
+
+def _exclude_resting_contacts(spec: mujoco.MjSpec):
+  """Exclude body pairs whose collision meshes already overlap in the home pose."""
+  model = spec.copy().compile()  # fusestatic edits the spec, so never compile it twice.
+  data = mujoco.MjData(model)
+  data.qpos[2] = 2.0
+  data.qpos[3] = 1.0
+  data.qpos[7:] = DEFAULT_JOINT_POS
+  mujoco.mj_forward(model, data)
+  pairs = set()
+  for c in data.contact[:data.ncon]:
+    b1, b2 = sorted((model.geom_bodyid[c.geom1], model.geom_bodyid[c.geom2]))
+    if b1 != b2:
+      pairs.add((model.body(b1).name, model.body(b2).name))
+  for b1, b2 in sorted(pairs):
+    spec.add_exclude(bodyname1=b1, bodyname2=b2)
+
+
+def make_spec(visual: bool = True) -> mujoco.MjSpec:
+  spec = mujoco.MjSpec.from_string(_urdf_xml(visual))
+  spec.worldbody.first_body().add_freejoint(name="root")
+  _use_convex_hulls(spec)
+  _add_scene(spec)
+
+  foot_bodies = set(FOOT_BODIES.values())
+  for geom in spec.geoms:
+    if geom.name.endswith("_collision"):
+      is_foot = geom.parent.name in foot_bodies
+      mask = _FOOT_MESH if is_foot else _BODY_MESH
+      geom.contype, geom.conaffinity = mask["contype"], mask["conaffinity"]
+      geom.condim = 1
+      geom.group = 3
+    elif geom.type == mujoco.mjtGeom.mjGEOM_MESH:
+      geom.contype = geom.conaffinity = 0
+
+  for side, name in FOOT_BODIES.items():
+    body = spec.body(name)
+    body.add_site(name=f"{side}_foot", pos=list(FOOT_SITE_POS))
+    for i, (x, y) in enumerate(_FOOT_SPHERES, start=1):
+      body.add_geom(name=f"{side}_foot{i}_collision", type=mujoco.mjtGeom.mjGEOM_SPHERE,
+                    size=[_FOOT_SPHERE_RADIUS, 0, 0], pos=[x, y, _SOLE_Z + _FOOT_SPHERE_RADIUS],
+                    condim=3, priority=1, friction=[0.6, 0.005, 0.0001], group=3,
+                    rgba=[0.9, 0.3, 0.3, 1], **_FOOT_SPHERE)
+
+  for joint in spec.joints:
+    if joint.type == mujoco.mjtJoint.mjJNT_FREE:
+      continue
+    armature, kp, kd, effort = _actuator_params(joint.name)
+    joint.armature = armature
+    joint.actfrclimited = mujoco.mjtLimited.mjLIMITED_FALSE  # URDF effort="1" is a placeholder.
+    act = spec.add_actuator(name=joint.name, target=joint.name)
+    act.trntype = mujoco.mjtTrn.mjTRN_JOINT
+    act.set_to_position(kp=kp, kv=kd)
+    act.forcelimited = mujoco.mjtLimited.mjLIMITED_TRUE
+    act.forcerange = [-effort, effort]
+
+  _add_sensors(spec)
+  _exclude_resting_contacts(spec)
+  return spec
+
+
+def make_model(visual: bool = True) -> mujoco.MjModel:
+  model = make_spec(visual).compile()
+  names = tuple(model.joint(i).name for i in range(1, model.njnt))
+  assert names == JOINT_NAMES, names
+  return model
+
+
+def soft_joint_limits(model: mujoco.MjModel) -> np.ndarray:
+  rng = model.jnt_range[1:]
+  mid, half = rng.mean(axis=1), 0.5 * (rng[:, 1] - rng[:, 0]) * SOFT_JOINT_LIMIT_FACTOR
+  return np.stack([mid - half, mid + half], axis=1)
+
+
+def init_base_height(model: mujoco.MjModel) -> float:
+  """Base height that puts the feet 1 mm above the floor in the home pose."""
+  data = mujoco.MjData(model)
+  data.qpos[3] = 1.0
+  data.qpos[7:] = DEFAULT_JOINT_POS
+  mujoco.mj_kinematics(model, data)
+  feet = [i for i in range(model.ngeom) if FOOT_GEOM_RE.match(model.geom(i).name or "")]
+  return float(-(data.geom_xpos[feet, 2] - model.geom_size[feet, 0]).min() + 0.001)
