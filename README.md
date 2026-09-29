@@ -19,6 +19,25 @@ velocity commands. It uses the exact training setup from `~/Desktop/g1_mac_rl`
 uv venv .venv --python 3.12 && uv pip install --python .venv/bin/python -r requirements.txt
 ```
 
+
+## Pretrained policy
+
+A trained policy is included, so you can try the robot without training anything:
+
+- `pretrained/policy.onnx`: the trained walking policy
+- `pretrained/demo.mp4`: full video of the policy walking
+
+Pass it with `--policy`:
+
+```bash
+.venv/bin/mjpython scripts/play.py --policy pretrained/policy.onnx
+.venv/bin/python scripts/record_video.py --policy pretrained/policy.onnx --view grid
+.venv/bin/python scripts/eval_policy.py --policy pretrained/policy.onnx
+```
+
+Without `--policy`, the scripts use the newest run in `runs/`, so they only work after you have trained your own policy.
+
+
 ## Train
 
 ```bash
@@ -37,6 +56,7 @@ runs/<date>/
 ```
 
 ## Watch / record / score
+By default these use your newest run in `runs/`. To use the included policy, add `--policy pretrained/policy.onnx`.
 
 ```bash
 .venv/bin/mjpython scripts/play.py                         # ↑/↓ speed, ←/→ turn, ,/. sideways, 0 stop
