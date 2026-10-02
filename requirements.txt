@@ -1,0 +1,8 @@
+mujoco>=3.3
+numpy
+torch
+onnx
+onnxruntime
+tensorboard
+imageio[ffmpeg]
+scipy
